@@ -6,9 +6,9 @@ authors = ["Guillaume Boyé"]
 license = "MIT"
 repository = "https://github.com/BoyeGuillaume/rust-lockless-slotmap"
 description = "A (mostly) lockless slotmap implementation in Rust"
+documentation = "https://docs.rs/rust-lockless-slotmap/index.html"
 keywords = ["slotmap", "lockless", "concurrent", "thread-safe", "data-structure"]
 readme = "README.md"
-documentation = "https://docs.rs/rust-lockless-slotmap"
 
 [dependencies]
 crossbeam = "0.8.4"
