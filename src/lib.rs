@@ -3,23 +3,42 @@ use std::{cell::UnsafeCell, mem::MaybeUninit, sync::atomic::AtomicUsize};
 use utils::{AtomicOptionU32, AtomicOptionU64, AtomicState, State};
 
 #[cfg(test)]
-pub mod tests;
-pub mod utils;
+mod tests;
+mod utils;
 
-///
-/// This constant represents the maximum number of elements
-/// per block at the maximum size of the slotmap.
+/// Maximum number of elements per allocation block.
 /// 
-const MAX_ELEMENTS_PER_BLOCK: usize = 32768;
+/// [`SlotmapTicket`] allows for stable references to elements in the slotmap, as such
+/// dynamic resizing of the slotmap is not possible. In order to achieve this, the
+/// slotmap is divided into blocks, each block having a fixed number of elements. 
+/// 
+/// The slotmap can only grow by adding new blocks. The number of element per block
+/// starts at 64 (default) and can grow up to a limit defined by [`MAX_ELEMENTS_PER_BLOCK`].
+/// 
+/// The maximum theoretical number of elements per block is 2^32 (due to constraints on
+/// the [`SlotmapTicket`] structure).
+pub const MAX_ELEMENTS_PER_BLOCK: usize = 32768;
 const _: () = assert!(MAX_ELEMENTS_PER_BLOCK < std::u32::MAX as usize, "The MAX_ELEMENTS_PER_BLOCK must be less than u32::MAX (constraint due to AtomicState)");
 
-///
-/// Structure that represents a ticket for a slot in the slotmap.
+/// Holds a ticket (think of it as a reference) to an element stored in the slotmap.
 /// 
-/// The ticket can then be used to access the slot in the slotmap. 
-///
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlotmapTicket(u64);
+/// The ticket is used to access the element stored in the slotmap. The ticket is
+/// created when the element is inserted into the slotmap and is used to access
+/// the element until the element is removed from the slotmap.
+/// 
+/// Notice that the slotmap implementation ensures that each ticket is unique. If
+/// an element is removed from the slotmap, the ticket is invalidated and cannot
+/// be used, even if the slot is reused.
+/// 
+/// You can retrieve the element corresponding to the ticket using the
+/// [`LocklessSlotmap::get`] which will also guarantee that the element is not
+/// removed while it is being accessed. This ticket makes no such guarantees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SlotmapTicket {
+    block_index: u16,
+    generation: u16,
+    slot_index: u32,
+}
 
 impl SlotmapTicket {
     pub(crate) fn new(block_index: u16, slot_index: u32, generation: u16) -> Self
@@ -27,49 +46,69 @@ impl SlotmapTicket {
         assert!(block_index <= std::u16::MAX, "The block index has exceeded the maximum value of u16");
         assert!(generation <= std::u16::MAX, "The generation has exceeded the maximum value of u16");
 
-        Self(
-            block_index as u64 |
-            ((generation as u64) << 16) |
-            ((slot_index as u64) << 32)
-        )
+        Self {
+            block_index: block_index,
+            generation: generation,
+            slot_index: slot_index,
+        }
     }
 
     pub(crate) fn block_index(&self) -> u16
     {
-        (self.0 & 0xffff) as u16
+        self.block_index
     }
 
     pub(crate) fn generation(&self) -> u16
     {
-        ((self.0 & 0xffff_0000) >> 16) as u16
+        self.generation
     }
 
     pub(crate) fn slot_index(&self) -> u32
     {
-        ((self.0 & 0xffff_ffff_0000_0000) >> 32) as u32
+        self.slot_index
     }
 }
 
-///
-/// Structure that represents an element currently stored in the slotmap. 
+/// SlotmapEntry is a reference to an element stored in the slotmap.
 /// 
-/// The structure provides a reference to the element, and ensures that the
-/// element cannot be removed from the slotmap while the reference is alive. Any
-/// call to the slotmap that would remove the element will block until the reference
-/// is dropped.
-///
+/// The SlotmapEntry is created when the element is accessed in the slotmap. It
+/// ensures that the element cannot be removed while there is a thread actively
+/// accessing it.
+/// 
+/// # Note
+/// 
+/// It is the responsibility of the user to ensure that the SlotmapEntry is dropped
+/// prior to removing the element from the slotmap. Failure to do so will result in
+/// a deadlock, where the erasing method will wait indefinitely for the 
+/// SlotmapEntry to be dropped.
+/// 
+/// # Example
+/// ```
+/// use lockless_slotmap::LocklessSlotmap;
+/// use parking_lot::RawRwLock;
+/// 
+/// let slotmap: LocklessSlotmap<usize, RawRwLock> = LocklessSlotmap::new();
+/// let ticket = slotmap.insert(42);
+/// 
+/// {
+///    let entry = slotmap.get(ticket).unwrap();
+///    assert_eq!(*entry, 42);
+/// }
+/// ```
+/// 
 pub struct SlotmapEntry<'a, T> {
     atomic_ref: &'a AtomicUsize,
     data: &'a T,
 }
 
 impl <'a, T> SlotmapEntry<'a, T> {
-    ///
-    /// Gets a reference to the element stored in the slotmap.
+    /// Get a reference to the element stored in the slotmap.
+    /// 
+    /// This reference cannot outlive the protection of the SlotmapEntry.
+    /// Therefore all access to this element are guaranteed to be safe.
     /// 
     /// # Returns
     /// A reference to the element stored in the slotmap.
-    ///
     pub fn get<'b: 'a>(&'b self) -> &'b T
     {
         self.data
@@ -141,7 +180,65 @@ impl <T> LocklessSlotmapBlock<T> {
     }
 }
 
-
+/// LocklessSlotmap is a lockless implementation of a slotmap.
+/// 
+/// A slotmap is a data structure that allows for stable references to elements
+/// while providing fast insertion (in O(1) time) and removal (in O(1) time).
+/// 
+/// This implementation is (mostly) lockless, meaning that it can be used in a
+/// high performance environment where locks are not desired. The only place where
+/// locks are used is when the slotmap becomes saturated and a new block needs to
+/// be allocated. Because of the ever-growing exponential size of the blocks, this
+/// should be a rare occurrence.
+/// 
+/// # Limitations
+/// 
+/// Each slot in the slotmap can only be reused so many times. 16-bit generation
+/// numbers are kept as guard against ABA problems, this means that each slot can
+/// only be reused 65536 times (after which the slot is considered "dead" and will
+/// not be reused which can lead to slowly increasing memory usage). Therefore for
+/// very long running applications with high insertion and removal rates, this
+/// implementation may not be suitable.
+/// 
+/// # Implementation
+/// 
+/// Internally, the slotmap is divided into blocks, each block containing a fixed
+/// number of elements. When the slotmap is saturated, a new block is allocated
+/// without invalidating all the already existing blocks. This allows for fast
+/// insertion and removal of elements.
+/// 
+/// Blocks grow exponentially in size, starting at 64 elements (default) and
+/// growing up to a maximum of [`MAX_ELEMENTS_PER_BLOCK`] elements.
+/// 
+/// # Note
+/// 
+/// In the current implementation, the insertion of new elements takes the place of
+/// the most recently removed element. At high loads this behavior can lead to
+/// excessive memory fragmentation. This behavior may be changed in the future.
+/// 
+/// # Example
+/// ```
+/// use lockless_slotmap::LocklessSlotmap;
+/// use std::sync::Arc;
+/// use parking_lot::RawRwLock;
+/// 
+/// let slotmap: Arc<LocklessSlotmap<usize, RawRwLock>> = Arc::new(LocklessSlotmap::new());
+/// let ticket = slotmap.insert(42);
+/// 
+/// let slotmap_clone = Arc::clone(&slotmap);
+/// let handle = std::thread::spawn(move || {
+///    let entry = slotmap_clone.get(ticket).unwrap();
+///    slotmap_clone.insert(45);
+///    slotmap_clone.erase(ticket);
+///    assert_eq!(*entry, 42);
+/// });
+/// 
+/// handle.join().unwrap();
+/// 
+/// assert_eq!(slotmap.len(), 1);
+/// assert_eq!(slotmap.get(ticket), None);
+/// ```
+/// 
 pub struct LocklessSlotmap<T, R>
 where
     T: Sized + Send + Sync,
@@ -207,29 +304,30 @@ where
         self.capacity.fetch_add(next_block_size, std::sync::atomic::Ordering::Relaxed);
     }
 
-    ///
-    /// Creates a new slotmap with the default capacity (64 elements per block). Preallocates the first block.
+    /// Creates a new slotmap with the default capacity of 64 elements.
     /// 
     /// # Returns
-    /// A new slotmap with the default capacity.
+    /// A new slotmap with the default capacity of 64 elements.
     /// 
+    /// # Panics
+    /// Panics if the allocation of the first block fails.
     pub fn new() -> Self
     {
         Self::with_capacity(64)
     }
 
-    ///
-    /// Creates a new slotmap with the specified capacity. Preallocates the first block.
+    /// Creates a new slotmap with the specified capacity.
     /// 
     /// # Arguments
-    /// * `capacity` - The capacity of the slotmap.
+    /// * `capacity` - The capacity (number of elements) of the slotmap. This capacity is limited
+    ///                to [`MAX_ELEMENTS_PER_BLOCK`] elements. However, this limit should allow for
+    ///                a slotmap with a capacity of up to 2^32 elements.
     /// 
     /// # Returns
     /// A new slotmap with the specified capacity.
     /// 
     /// # Panics
-    /// Panics if the capacity is greater than MAX_ELEMENTS_PER_BLOCK or if the capacity is 0.
-    /// 
+    /// Panics if the capacity is greater than [`MAX_ELEMENTS_PER_BLOCK`].
     pub fn with_capacity(capacity: usize) -> Self
     {
         assert!(capacity <= MAX_ELEMENTS_PER_BLOCK, "The capacity of the slotmap must be less than or equal to MAX_ELEMENTS_PER_BLOCK");
@@ -247,6 +345,17 @@ where
         object
     }
 
+    /// Inserts a new element into the slotmap.
+    /// 
+    /// Atomically inserts a new element into the slotmap. The element is stored in the slotmap
+    /// and a ticket is returned that can be used to access the element.
+    /// 
+    /// # Arguments
+    /// * `value` - The value to insert into the slotmap.
+    /// 
+    /// # Returns
+    /// A ticket that can be used to access the element in the slotmap. The value of the ticket
+    /// can then be accessed using the [`LocklessSlotmap::get`] method.
     pub fn insert(&self, value: T) -> SlotmapTicket
     {
         let backoff = crossbeam::utils::Backoff::new();
@@ -358,15 +467,20 @@ where
         }
     }
 
-    ///
-    /// Gets a reference to the element stored in the slotmap at the specified ticket.
+    /// Get an element from the slotmap at the specified ticket.
+    /// 
+    /// Retrieves the element stored in the slotmap at the specified ticket. The ticket
+    /// is invalidated after the element is removed from the slotmap. For more information
+    /// you can refer to the [`SlotmapEntry`] structure.
     /// 
     /// # Arguments
-    /// * `ticket` - The ticket of the element in the slotmap.
+    /// * `ticket` - The ticket of the element in the slotmap. Tickets are invalidated
+    ///              after the element is removed from the slotmap. See [`SlotmapTicket`]
+    ///              for more details.
     /// 
     /// # Returns
-    /// A reference to the element stored in the slotmap at the specified ticket.
-    /// 
+    /// An [`Option<T>`] containing a [`SlotmapEntry`] to the element stored in the slotmap
+    /// at the specified ticket. If the ticket is invalid or the element has been removed
     pub fn get(&self, ticket: SlotmapTicket) -> Option<SlotmapEntry<'_, T>> {
         let block_index = ticket.block_index();
         let slot_index = ticket.slot_index();
@@ -418,15 +532,25 @@ where
         })
     }
 
-    ///
-    /// Remove an element from the slotmap at the specified ticket.
+    /// Erase an element from the slotmap at the specified ticket.
+    /// 
+    /// Removes the element stored in the slotmap at the specified ticket. The ticket is
+    /// invalidated after the element is removed from the slotmap. For more information
+    /// you can refer to the [`SlotmapEntry`] structure.
+    /// 
+    /// # Deadlocks
+    /// 
+    /// This method will wait for all [`SlotmapEntry`] corresponding to the ticket to be
+    /// dropped before removing the element from the slotmap. Special care should be taken
+    /// to ensure that the thread calling this method is not holding a [`SlotmapEntry`]
+    /// corresponding to the ticket or a deadlock will occur.
     /// 
     /// # Arguments
-    /// * `ticket` - The ticket of the element in the slotmap.
+    /// * `ticket` - The ticket of the element in the slotmap. Tickets are invalidated
     /// 
     /// # Returns
-    /// The element stored in the slotmap at the specified ticket.
-    /// 
+    /// An [`Option<T>`] containing the element stored in the slotmap at the specified ticket or
+    /// [`Option::None`] if the ticket is invalid or the element has already been removed.
     pub fn erase(&self, ticket: SlotmapTicket) -> Option<T> {
         let block_index = ticket.block_index();
         let slot_index = ticket.slot_index();
@@ -550,26 +674,41 @@ where
         }
     }
 
-    ///
-    /// Get the capacity of the slotmap.
+    /// Get the maximum number of elements that can be stored in the slotmap.
     /// 
+    /// # Returns
+    /// The maximum number of elements that can be stored in the slotmap. 
     pub fn capacity(&self) -> usize
     {
         self.capacity.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    ///
-    /// Get the number of elements in the slotmap.
+    /// Get the number of elements stored in the slotmap.
     /// 
+    /// Notice that in a multithreaded environment, the number of elements stored in the slotmap
+    /// can change between the time this method is called and the time the result is used, therefore
+    /// this method should be used as an approximation.
+    /// 
+    /// # Returns
+    /// The number of elements stored in the slotmap. 
     pub fn len(&self) -> usize
     {
         self.len.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    ///
-    /// Number of slots that have reached the maximum generation. Those slot
-    /// won't be available for reuse. 
-    ///
+    /// Number of times the generation limit has been reached.
+    /// 
+    /// As discussed in the limitations of the [`LocklessSlotmap`] structure, each slot can only
+    /// be reused so many times (2^16 times). When the generation limit is reached, the slot is
+    /// considered "dead" and will not be reused. This method returns the number of times dead
+    /// slots have been encountered.
+    /// 
+    /// Notice that in a multithreaded environment, the number of times the generation limit has
+    /// been reached can change between the time this method is called and the time the result is
+    /// used, therefore this method should be used as an approximation.
+    /// 
+    /// # Returns
+    /// The number of times the generation limit has been reached.
     pub fn generation_limit_reached(&self) -> usize
     {
         self.generation_limit_reached.load(std::sync::atomic::Ordering::SeqCst)
