@@ -406,8 +406,6 @@ where
             }
             else {
                 // Another thread has made a progress, retry
-                // FIXME: Race-Condition: test_multithreaded_insertion_and_removal stuck here
-                // because the next_block is always saturated
                 backoff.spin();
                 continue;
             };
@@ -640,37 +638,36 @@ where
                     ).is_err() {
                         // Another thread has made a progress, retry
                         backoff.spin();
-                        continue;
+                        continue 'update_slot;
                     }
 
-                    // If next_free_slot is None, that means that this blog was dangling
-                    // and now it is not anymore, we need to update the next_non_saturated_block
-                    if next_free_slot.is_none() {
-                        let next_non_saturated_block = 'update_block: loop {
-                            let next_non_saturated_block = self.next_non_saturated_block.load(std::sync::atomic::Ordering::SeqCst);
-                            
-                            // Attempt to update the next_non_saturated_block
-                            if self.next_non_saturated_block.compare_exchange(
-                                next_non_saturated_block,
-                                Some(block_index as u64),
-                                std::sync::atomic::Ordering::SeqCst,
-                                std::sync::atomic::Ordering::SeqCst
-                            ).is_err() {
-                                // Another thread has made a progress, retry
-                                backoff.spin();
-                                continue;
-                            }
+                    break 'update_slot next_free_slot;
+                };
 
-                            // We finally update the next_free_slot of the slot
-                            break 'update_block next_non_saturated_block;
-                        };
+                // If next_free_slot is None, that means that this blog was dangling
+                // and now it is not anymore, we need to update the next_non_saturated_block
+                if next_free_slot.is_none() {
+                    let next_non_saturated_block = 'update_block: loop {
+                        let next_non_saturated_block = self.next_non_saturated_block.load(std::sync::atomic::Ordering::SeqCst);
+                        
+                        // Attempt to update the next_non_saturated_block
+                        if self.next_non_saturated_block.compare_exchange(
+                            next_non_saturated_block,
+                            Some(block_index as u64),
+                            std::sync::atomic::Ordering::SeqCst,
+                            std::sync::atomic::Ordering::SeqCst
+                        ).is_err() {
+                            // Another thread has made a progress, retry
+                            backoff.spin();
+                            continue 'update_block;
+                        }
 
-                        // We then update the next_non_saturated_block of the block
-                        block.next_non_saturated_block.store(next_non_saturated_block, std::sync::atomic::Ordering::SeqCst);
+                        // We finally update the next_free_slot of the slot
+                        break 'update_block next_non_saturated_block;
                     };
 
-                    // We finally update the next_free_slot of the slot
-                    break 'update_slot next_free_slot;
+                    // We then update the next_non_saturated_block of the block
+                    block.next_non_saturated_block.store(next_non_saturated_block, std::sync::atomic::Ordering::SeqCst);
                 };
 
                 // The generation has not reached the maximum value, we can reuse this slot
