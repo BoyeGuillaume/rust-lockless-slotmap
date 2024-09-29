@@ -1,0 +1,19 @@
+[package]
+name = "rust-lockless-slotmap"
+version = "0.1.0"
+edition = "2021"
+authors = ["Guillaume Boyé"]
+license = "MIT"
+repository = "https://github.com/BoyeGuillaume/rust-lockless-slotmap"
+description = "A (mostly) lockless slotmap implementation in Rust"
+keywords = ["slotmap", "lockless", "concurrent", "thread-safe", "data-structure"]
+readme = "README.md"
+
+[dependencies]
+crossbeam = "0.8.4"
+lock_api = "0.4.12"
+
+[dev-dependencies]
+parking_lot = "0.12.3"
+rand = "0.8.5"
+rand_chacha = "0.3.1"
