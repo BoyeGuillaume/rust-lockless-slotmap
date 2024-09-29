@@ -1,5 +1,3 @@
-//! 
-//! 
 //! # Lockless Slotmap
 //! 
 //! Lockless Slotmap is a lockless implementation of a slotmap. A slotmap is a data structure that
