@@ -476,7 +476,7 @@ pub fn test_slotmap_multithreaded_with_erase() {
     test_slotmap_multithreaded_impl(true);
 }
 
-// #[test]
-// pub fn test_slotmap_multithreaded_without_erase() {
-//     test_slotmap_multithreaded_impl(false);
-// }
+#[test]
+pub fn test_slotmap_multithreaded_without_erase() {
+    test_slotmap_multithreaded_impl(false);
+}
