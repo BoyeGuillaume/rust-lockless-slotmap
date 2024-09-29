@@ -351,9 +351,48 @@ pub fn test_slotmap_cannot_erase_while_locked() {
     assert!(elapsed.as_secs() >= 1, "The slotmap was not locked for at least one second");
 }
 
-fn test_slotmap_multithreaded_impl(with_erase: bool) {
+#[test]
+pub fn test_slotmap_with_delayed_insertion() {
+    // Case 1: Insert an element with delayed insertion
+    let elem_count = Arc::new(AtomicUsize::new(0));
+    let slotmap: LocklessSlotmap<(LeakDetector, usize), parking_lot::RawRwLock> = crate::LocklessSlotmap::with_capacity(64);
+    
+    let delayed_elem0 = slotmap.delayed_insert();
+
+    slotmap.insert((LeakDetector::new(elem_count.clone()), 1));
+    slotmap.insert((LeakDetector::new(elem_count.clone()), 2));
+
+    assert!(slotmap.get(delayed_elem0.ticket()).is_none());
+    assert!(slotmap.erase(delayed_elem0.ticket()).is_none());
+
+    let elem0_delayed_ticket = delayed_elem0.ticket();
+    let elem0_ticket = delayed_elem0.commit((LeakDetector::new(elem_count.clone()), 0));
+
+    assert_eq!(slotmap.len(), 3);
+    assert_eq!(slotmap.get(elem0_ticket).unwrap().1, 0);
+    assert_eq!(elem0_delayed_ticket, elem0_ticket);
+    drop(slotmap);
+
+    // Case 2: Insert an element with delayed insertion and rollback
+    let elem_count = Arc::new(AtomicUsize::new(0));
+    let slotmap: LocklessSlotmap<(LeakDetector, usize), parking_lot::RawRwLock> = crate::LocklessSlotmap::with_capacity(64);
+
+    let delayed_elem0 = slotmap.delayed_insert();
+
+    slotmap.insert((LeakDetector::new(elem_count.clone()), 1));
+    slotmap.insert((LeakDetector::new(elem_count.clone()), 2));
+
+    let elem0_ticket = delayed_elem0.ticket();
+    delayed_elem0.rollback();
+
+    assert_eq!(slotmap.len(), 2);
+    assert!(slotmap.get(elem0_ticket).is_none());
+}
+
+fn test_slotmap_multithreaded_impl(with_erase: bool, with_delayed_insert: bool) {
     let elem_count = Arc::new(AtomicUsize::new(0));
     let next_element = Arc::new(AtomicUsize::new(0));
+    let total_allocated_element = Arc::new(AtomicUsize::new(0));
     let barrier_start = Arc::new(std::sync::Barrier::new(THREAD_COUNT));
     let mut root_rng = rand_chacha::ChaCha20Rng::seed_from_u64(TEST_SEED + 1);
 
@@ -361,14 +400,23 @@ fn test_slotmap_multithreaded_impl(with_erase: bool) {
         let slotmap: Arc<LocklessSlotmap<(LeakDetector, usize), parking_lot::RawRwLock>> = Arc::new(LocklessSlotmap::with_capacity(64));
         elem_count.store(0, std::sync::atomic::Ordering::Relaxed);
         next_element.store(0, std::sync::atomic::Ordering::Relaxed);
+        total_allocated_element.store(0, std::sync::atomic::Ordering::Relaxed);
 
         let mut threads = Vec::with_capacity(THREAD_COUNT);
         for _ in 0..THREAD_COUNT {
             let slotmap = slotmap.clone();
+            let barrier_start = barrier_start.clone();
+
+            // Sometime atomic can introduce enough delay to make the test pass
             let elem_count = elem_count.clone();
             let next_element = next_element.clone();
-            let barrier_start = barrier_start.clone();
+            let total_allocated_element = total_allocated_element.clone();
+            // let elem_count = Arc::new(AtomicUsize::new(0));
+            // let next_element = Arc::new(AtomicUsize::new(0));
+            // let total_allocated_element = Arc::new(AtomicUsize::new(0));
+
             let p: f64 = root_rng.gen_range(0.1..0.9);
+            let p_delayed: f64 = root_rng.gen_range(0.1..0.3);
             let seed = root_rng.next_u64();
 
             let fn_callback = move || {
@@ -376,6 +424,7 @@ fn test_slotmap_multithreaded_impl(with_erase: bool) {
                 let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(seed);
                 
                 let mut inserted = Vec::new();
+                let mut delayed_inserts = Vec::new();
                 let mut deleted_tickets = Vec::new();
 
                 for _ in 0..TEST_ITERATIONS_VERY_LARGE {
@@ -389,11 +438,43 @@ fn test_slotmap_multithreaded_impl(with_erase: bool) {
                     }
 
                     if should_insert {
-                        let element_value = next_element.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let element = (LeakDetector::new(elem_count.clone()), element_value);
-                        let ticket = slotmap.insert(element);
+                        let should_delayed_insert = with_delayed_insert && rng.gen_bool(p_delayed);
 
-                        inserted.push((ticket, element_value));
+                        if should_delayed_insert {
+                            // Select between creating a new delayed insert or committing or rolling back an existing one
+                            let probability_create: f64 = f64::powf(1.055, -(delayed_inserts.len() as f64));
+                            let should_create = delayed_inserts.is_empty() || rng.gen_bool(probability_create);
+
+                            if should_create {
+                                let delayed_insert = slotmap.delayed_insert();
+                                delayed_inserts.push(delayed_insert);
+                                total_allocated_element.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            else {
+                                let index = rng.gen_range(0..delayed_inserts.len());
+                                let delayed_insert = delayed_inserts.remove(index);
+
+                                if rng.gen_bool(0.5) {
+                                    let element_value = next_element.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let ticket = delayed_insert.ticket();
+                                    let committed_ticket = delayed_insert.commit((LeakDetector::new(elem_count.clone()), element_value));
+                                    assert_eq!(ticket, committed_ticket);
+                                    inserted.push((ticket, element_value));
+                                }
+                                else {
+                                    delayed_insert.rollback();
+                                    total_allocated_element.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        else {
+                            let element_value = next_element.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            total_allocated_element.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let element = (LeakDetector::new(elem_count.clone()), element_value);
+                            let ticket = slotmap.insert(element);
+
+                            inserted.push((ticket, element_value));
+                        }
                     }
                     else {
                         // Remove a random element from the inserted elements
@@ -411,6 +492,7 @@ fn test_slotmap_multithreaded_impl(with_erase: bool) {
                         // Check that the element is no longer in the slotmap
                         assert_eq!(element.1, element_value);
                         deleted_tickets.push(ticket);
+                        total_allocated_element.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     }
 
                     // Perform test at intervals
@@ -444,11 +526,19 @@ fn test_slotmap_multithreaded_impl(with_erase: bool) {
             let stop = stop.clone();
             let slotmap = slotmap.clone();
             let next_element = next_element.clone();
+            let total_allocated_element = total_allocated_element.clone();
 
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    println!("Slotmap len: {}, capacity: {}, generation limit: {}, next element: {}", slotmap.len(), slotmap.capacity(), slotmap.generation_limit_reached(), next_element.load(std::sync::atomic::Ordering::Relaxed));
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    println!(
+                        "Slotmap len: {}, capacity: {}, generation limit: {}, next element: {}, total allocated element: {}",
+                        slotmap.len(), 
+                        slotmap.capacity(),
+                        slotmap.generation_limit_reached(),
+                        next_element.load(std::sync::atomic::Ordering::Relaxed),
+                        total_allocated_element.load(std::sync::atomic::Ordering::Relaxed)
+                    );
                 }
             })
         };
@@ -473,10 +563,15 @@ fn test_slotmap_multithreaded_impl(with_erase: bool) {
 
 #[test]
 pub fn test_slotmap_multithreaded_with_erase() {
-    test_slotmap_multithreaded_impl(true);
+    test_slotmap_multithreaded_impl(true, false);
 }
 
 #[test]
 pub fn test_slotmap_multithreaded_without_erase() {
-    test_slotmap_multithreaded_impl(false);
+    test_slotmap_multithreaded_impl(false, false);
 }
+
+// #[test]
+// pub fn test_slotmap_multithreaded_with_delayed_insert_and_erase() {
+//     test_slotmap_multithreaded_impl(true, true);
+// }

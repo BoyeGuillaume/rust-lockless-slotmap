@@ -1,8 +1,10 @@
 //! # Lockless Slotmap
 //! 
-//! Lockless Slotmap is a lockless implementation of a slotmap. A slotmap is a data structure that
-//! allows for stable references to elements while providing fast insertion (in O(1) time) and
-//! removal (in O(1) time).
+//! [`LocklessSlotmap`] is a lockless implementation of a slotmap. A slotmap is a data structure
+//! that allows for stable references to elements while providing fast insertion (in O(1) time) with
+//! [`LocklessSlotmap::insert`] and fast removal (in O(1) time) with [`LocklessSlotmap::erase`]. It
+//! also allows for delayed insertion using the method [`LocklessSlotmap::delayed_insert`] which can
+//! be useful in some scenarios.
 //! 
 //! This implementation is (mostly) lockless, meaning that it can be used in a high performance
 //! environment where locks are not desired. The only place where locks are used is when the slotmap
@@ -46,6 +48,7 @@
 
 use std::{cell::UnsafeCell, mem::MaybeUninit, sync::atomic::AtomicUsize};
 
+use lock_api::RwLockReadGuard;
 use utils::{AtomicOptionU32, AtomicOptionU64, AtomicState, State};
 
 #[cfg(test)]
@@ -112,6 +115,131 @@ impl SlotmapTicket {
     pub(crate) fn slot_index(&self) -> u32
     {
         self.slot_index
+    }
+}
+
+/// DelayedInsertion is a structure that allows for the delayed insertion
+/// of an element into the slotmap.
+/// 
+/// Sometimes it is necessary to know the [`SlotmapTicket`] of an element
+/// before the element is actually inserted into the slotmap. This structure
+/// allows for the reservation of a slot in the slotmap without actually
+/// creating it. The slot can then be either committed or rolled back 
+/// using the [`DelayedInsertion::commit`] or [`DelayedInsertion::rollback`]
+/// methods. If the [`DelayedInsertion`] is dropped without being committed,
+/// the slot is automatically rolled back.
+/// 
+/// To create a [`DelayedInsertion`] use the [`LocklessSlotmap::delayed_insert`]
+/// method.
+/// 
+/// # Note
+/// 
+/// While the [`DelayedInsertion`] has not been committed nor rolled back, any
+/// calls to the [`LocklessSlotmap::get`] or [`LocklessSlotmap::erase`] methods
+/// will return [`None`].
+///
+/// # Example
+/// ```
+/// use rust_lockless_slotmap::{LocklessSlotmap, SlotmapTicket};
+/// use parking_lot::RawRwLock;
+/// 
+/// struct MyStruct {
+///     ticket: SlotmapTicket,
+///     value: usize,
+/// }
+/// 
+/// let slotmap: LocklessSlotmap<MyStruct, RawRwLock> = LocklessSlotmap::new();
+/// let delayed_insertion = slotmap.delayed_insert();
+/// 
+/// let element = MyStruct {
+///     ticket: delayed_insertion.ticket(),
+///     value: 42,
+/// };
+/// 
+/// let ticket = delayed_insertion.commit(element);
+/// 
+/// 
+/// // Element is now inserted into the slotmap
+/// let entry = slotmap.get(ticket).unwrap();
+/// assert_eq!(entry.value, 42);
+/// assert_eq!(entry.ticket, ticket);
+/// ```
+///
+pub struct DelayedInsertion<'a, T, R>
+where 
+    T: Sized + Send + Sync,
+    R: lock_api::RawRwLock,
+{
+    slotmap: &'a LocklessSlotmap<T, R>,
+    ticket: SlotmapTicket,
+    completed: bool,
+}
+
+impl <'a, T, R> DelayedInsertion<'a, T, R>
+where
+    T: Sized + Send + Sync,
+    R: lock_api::RawRwLock,
+{
+    fn rollback_impl(&self)
+    {
+        let _ = self.slotmap.rollback(&self.slotmap.blocks.read(), self.ticket, false);
+    }
+
+    /// Commit the insertion of the element into the slotmap.
+    /// 
+    /// Commits the insertion of the element into the slotmap. The element is
+    /// inserted into the slotmap and the slot is no longer reserved.
+    /// 
+    /// # Arguments
+    /// * `value` - The value to insert into the slotmap.
+    /// 
+    /// # Returns
+    /// The [`SlotmapTicket`] of the element that has been inserted into the slotmap. This
+    /// ticket is guaranteed to be equal to the ticket returned by the [`DelayedInsertion::ticket`]
+    pub fn commit(mut self, value: T) -> SlotmapTicket
+    {
+        self.slotmap.commit_insert(&self.slotmap.blocks.read(), self.ticket, value);
+        self.completed = true;
+        self.ticket
+    }
+
+    /// Rollback the reservation of the slot.
+    /// 
+    /// Cancels the reservation of the slot and makes it available for other future allocations.
+    /// The ticket is invalidated and cannot be used to access the element.
+    pub fn rollback(mut self)
+    {
+        self.rollback_impl();
+        self.completed = true;
+    }
+
+    /// Get the [`SlotmapTicket`] of the slot that has been reserved.
+    /// 
+    /// # Note
+    /// 
+    /// If it is true that [`DelayedInsertion`] allows for the insertion of an element
+    /// into the slotmap without actually creating it, the [`SlotmapTicket`] still can't
+    /// be used for retrieval nor for erasing until the element has been properly inserted.
+    /// 
+    /// # Returns
+    /// 
+    /// The [`SlotmapTicket`] of the slot that has been reserved.
+    pub fn ticket(&self) -> SlotmapTicket
+    {
+        self.ticket
+    }
+}
+
+impl <'a, T, R> Drop for DelayedInsertion<'a, T, R>
+where
+    T: Sized + Send + Sync,
+    R: lock_api::RawRwLock,
+{
+    fn drop(&mut self)
+    {
+        if !self.completed {
+            self.rollback_impl();
+        }
     }
 }
 
@@ -327,59 +455,13 @@ where
         self.capacity.fetch_add(next_block_size, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Creates a new slotmap with the default capacity of 64 elements.
-    /// 
-    /// # Returns
-    /// A new slotmap with the default capacity of 64 elements.
-    /// 
-    /// # Panics
-    /// Panics if the allocation of the first block fails.
-    pub fn new() -> Self
-    {
-        Self::with_capacity(64)
-    }
-
-    /// Creates a new slotmap with the specified capacity.
+    /// Reserve a slot in the slotmap.
     /// 
     /// # Arguments
-    /// * `capacity` - The capacity (number of elements) of the slotmap. This capacity is limited
-    ///                to [`MAX_ELEMENTS_PER_BLOCK`] elements. However, this limit should allow for
-    ///                a slotmap with a capacity of up to 2^32 elements.
     /// 
     /// # Returns
-    /// A new slotmap with the specified capacity.
-    /// 
-    /// # Panics
-    /// Panics if the capacity is greater than [`MAX_ELEMENTS_PER_BLOCK`].
-    pub fn with_capacity(capacity: usize) -> Self
-    {
-        assert!(capacity <= MAX_ELEMENTS_PER_BLOCK, "The capacity of the slotmap must be less than or equal to MAX_ELEMENTS_PER_BLOCK");
-        assert!(capacity > 0, "The capacity of the slotmap must be greater than 0");
-
-        let object = Self {
-            blocks: lock_api::RwLock::new(Vec::new()),
-            next_non_saturated_block: AtomicOptionU64::new(None),
-            next_block_size: AtomicUsize::new(capacity),
-            capacity: AtomicUsize::new(0),
-            len: AtomicUsize::new(0),
-            generation_limit_reached: AtomicUsize::new(0),
-        };
-        object.alloc_block(); // Pre-allocate the first block
-        object
-    }
-
-    /// Inserts a new element into the slotmap.
-    /// 
-    /// Atomically inserts a new element into the slotmap. The element is stored in the slotmap
-    /// and a ticket is returned that can be used to access the element.
-    /// 
-    /// # Arguments
-    /// * `value` - The value to insert into the slotmap.
-    /// 
-    /// # Returns
-    /// A ticket that can be used to access the element in the slotmap. The value of the ticket
-    /// can then be accessed using the [`LocklessSlotmap::get`] method.
-    pub fn insert(&self, value: T) -> SlotmapTicket
+    /// A ticket to the slot that has been reserved and the lock to the blocks.
+    fn reserve_slots(&self) -> (SlotmapTicket, RwLockReadGuard<'_, R, Vec<LocklessSlotmapBlock<T>>>)
     {
         let backoff = crossbeam::utils::Backoff::new();
         loop {
@@ -392,7 +474,7 @@ where
             }
             else {
                 self.alloc_block();
-                continue; // Retry
+                continue; // Retry (no backoff as this is not the result of contention)
             };
 
             // Acquire the read lock (shared access) to the blocks
@@ -466,25 +548,297 @@ where
                 }
             }
 
-            // We then need to initialize the element at slot_index
-            unsafe {
-                let element = block.elements[slot_index as usize].get().as_mut().unwrap();
-                element.write(value);
-            }
+            break (SlotmapTicket::new(block_index as u16, slot_index, next_generation), blocks);
+        }
+    }
 
-            // We then need to transition the state of the slot to Occupied
+    /// Commit the insertion of the element into the slotmap.
+    /// 
+    /// Assumes that the slot has already been reserved, inserts the element
+    /// into the slotmap and commits the insertion.
+    /// 
+    /// # Arguments
+    /// * `blocks` - The blocks of the slotmap.
+    /// * `ticket` - The ticket of the slot to insert the element into.
+    /// * `generation` - The generation of the slot.
+    /// * `value` - The value to insert into the slot.
+    fn commit_insert(&self, blocks: &Vec<LocklessSlotmapBlock<T>>, ticket: SlotmapTicket, value: T)
+    {
+        let block_index = ticket.block_index();
+        let slot_index = ticket.slot_index();
+        let generation = ticket.generation();
+
+        // Acquire the read lock (shared access) to the blocks
+        let block = &blocks[usize::from(block_index)];
+        let slot_state = &block.states[slot_index as usize];
+
+        // We then need to initialize the element at slot_index
+        unsafe {
+            let element = block.elements[slot_index as usize].get().as_mut().unwrap();
+            element.write(value);
+        }
+
+        // We then need to transition the state of the slot to Occupied
+        if slot_state.state.compare_exchange(
+            State::Reserved,
+            State::Occupied { generation: generation },
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst
+        ).is_err() {
+            panic!("The slot is reserved, no overwriting should occur. Either one of the thread panicked or there is a bug.");
+        }
+
+        // Finally increment the length of the slotmap
+        self.len.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Rollback a slot reservation.
+    /// 
+    /// From a reserved slot (assumed to have no refcount), rollback the reservation
+    /// and make the slot available for other threads.
+    /// 
+    /// # Arguments
+    /// * `blocks` - The blocks of the slotmap.
+    /// * `ticket` - The ticket of the slot to rollback.
+    /// * `is_initialized` - Whether the slot was initialized or not. (Contains a value or not)
+    /// 
+    /// # Returns
+    /// [`Some<T>`] if the is_initialized is true, [`None`] otherwise.
+    fn rollback(&self, blocks: &Vec<LocklessSlotmapBlock<T>>, ticket: SlotmapTicket, is_initialized: bool) -> Option<T>
+    {
+        let block_index = ticket.block_index();
+        let slot_index = ticket.slot_index();
+        let ticket_generation = ticket.generation();
+        
+        let block = &blocks[usize::from(block_index)];
+        let slot_state = &block.states[slot_index as usize];
+
+        // Refcount must be 0 before rollback
+        debug_assert!(slot_state.refcount.load(std::sync::atomic::Ordering::SeqCst) == 0, "The refcount of the slot must be 0");
+
+        // We then attempt to add back the slot to the free list
+        let backoff = crossbeam::utils::Backoff::new();
+
+        // Retrieve the element
+        let element = if is_initialized {
+            let element = unsafe {
+                let element = block.elements[slot_index as usize].get().as_mut().unwrap();
+                element.assume_init_read()
+            };
+            Some(element)
+        }
+        else {
+            None
+        };
+
+        // We then attempt to transition the state of the slot to Fre
+        if let Some(next_generation) = ticket_generation.checked_add(1) {
+            // We update the next_free_slot of the block so that it points to this slot (currently reserved)
+            let next_free_slot = 'update_slot: loop {
+                let next_free_slot = block.next_free_slot.load(std::sync::atomic::Ordering::SeqCst);
+
+                if block.next_free_slot.compare_exchange(
+                    next_free_slot,
+                    Some(slot_index),
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst
+                ).is_err() {
+                    // Another thread has made a progress, retry
+                    backoff.spin();
+                    continue 'update_slot;
+                }
+
+                break 'update_slot next_free_slot;
+            };
+
+            // If next_free_slot is None, that means that this blog was dangling
+            // and now it is not anymore, we need to update the next_non_saturated_block
+            if next_free_slot.is_none() {
+                let next_non_saturated_block = 'update_block: loop {
+                    let next_non_saturated_block = self.next_non_saturated_block.load(std::sync::atomic::Ordering::SeqCst);
+                    
+                    // Attempt to update the next_non_saturated_block
+                    if self.next_non_saturated_block.compare_exchange(
+                        next_non_saturated_block,
+                        Some(block_index as u64),
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst
+                    ).is_err() {
+                        // Another thread has made a progress, retry
+                        backoff.spin();
+                        continue 'update_block;
+                    }
+
+                    // We finally update the next_free_slot of the slot
+                    break 'update_block next_non_saturated_block;
+                };
+
+                // We then update the next_non_saturated_block of the block
+                block.next_non_saturated_block.store(next_non_saturated_block, std::sync::atomic::Ordering::SeqCst);
+            };
+
+            // The generation has not reached the maximum value, we can reuse this slot
             if slot_state.state.compare_exchange(
                 State::Reserved,
-                State::Occupied { generation: next_generation },
+                State::Free {
+                    next_generation: next_generation,
+                    next_free_slot: next_free_slot,
+                },
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst
             ).is_err() {
-                panic!("Race condition detected, this is a bug, please report it.");
+                panic!("refcount is 0, the slot is reserved, no overwriting should occur, this is a bug, please report it.");
             }
-            
-            // Finally create the ticket
-            self.len.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return SlotmapTicket::new(block_index as u16, slot_index, next_generation);
+        }
+        else {
+            // The generation has reached the maximum value, we won't be reusing
+            // this slot, therefore we leave it as Reserved
+            self.generation_limit_reached.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        if is_initialized {
+            self.len.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        element
+    }
+
+    /// Reserve an occupied slot in the slotmap and wait for the refcount to reach 0.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `blocks` - The blocks of the slotmap.
+    /// * `ticket` - The ticket of the slot to reserve.
+    /// 
+    /// # Returns
+    /// Whether the operation succeeded (the slot was occupied with matching generation) or not.
+    fn reserve_occupied_slot(&self, blocks: &Vec<LocklessSlotmapBlock<T>>, ticket: SlotmapTicket) -> bool
+    {
+        let block_index = ticket.block_index();
+        let slot_index = ticket.slot_index();
+        let ticket_generation = ticket.generation();
+
+        let block = &blocks[usize::from(block_index)];
+        let slot_state = &block.states[slot_index as usize];
+
+        // Begin of the critical section
+        let backoff = crossbeam::utils::Backoff::new();
+        'critical: loop {
+            // Check that the slot is occupied and the generation matches
+            let state = slot_state.state.load(std::sync::atomic::Ordering::SeqCst);
+            match state {
+                State::Occupied { generation } if generation == ticket_generation => (),
+                _ => break 'critical false, // The slot is not occupied or the generation does not match
+            }
+
+            // Attempt to transition the state of the slot to Reserved
+            if slot_state.state.compare_exchange(
+                state,
+                State::Reserved,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst
+            ).is_err() {
+                // Another thread has made a progress, retry
+                backoff.spin();
+                continue;
+            }
+
+            // Second loop: Await for the refcount to hit 0
+            'zeroref: loop {
+                let refcount = slot_state.refcount.load(std::sync::atomic::Ordering::SeqCst);
+                if refcount == 0 {
+                    break 'zeroref;
+                }
+
+                // Another thread has made a progress, retry
+                backoff.snooze();
+            }
+
+            // Break the loop and return the next_free_slot and next_generation
+            break 'critical true;
+        }
+    }
+
+    /// Creates a new slotmap with the default capacity of 64 elements.
+    /// 
+    /// # Returns
+    /// A new slotmap with the default capacity of 64 elements.
+    /// 
+    /// # Panics
+    /// Panics if the allocation of the first block fails.
+    pub fn new() -> Self
+    {
+        Self::with_capacity(64)
+    }
+
+    /// Creates a new slotmap with the specified capacity.
+    /// 
+    /// # Arguments
+    /// * `capacity` - The capacity (number of elements) of the slotmap. This capacity is limited
+    ///                to [`MAX_ELEMENTS_PER_BLOCK`] elements. However, this limit should allow for
+    ///                a slotmap with a capacity of up to 2^32 elements.
+    /// 
+    /// # Returns
+    /// A new slotmap with the specified capacity.
+    /// 
+    /// # Panics
+    /// Panics if the capacity is greater than [`MAX_ELEMENTS_PER_BLOCK`].
+    pub fn with_capacity(capacity: usize) -> Self
+    {
+        assert!(capacity <= MAX_ELEMENTS_PER_BLOCK, "The capacity of the slotmap must be less than or equal to MAX_ELEMENTS_PER_BLOCK");
+        assert!(capacity > 0, "The capacity of the slotmap must be greater than 0");
+
+        let object = Self {
+            blocks: lock_api::RwLock::new(Vec::new()),
+            next_non_saturated_block: AtomicOptionU64::new(None),
+            next_block_size: AtomicUsize::new(capacity),
+            capacity: AtomicUsize::new(0),
+            len: AtomicUsize::new(0),
+            generation_limit_reached: AtomicUsize::new(0),
+        };
+        object.alloc_block(); // Pre-allocate the first block
+        object
+    }
+
+    /// Inserts a new element into the slotmap.
+    /// 
+    /// Atomically inserts a new element into the slotmap. The element is stored in the slotmap
+    /// and a ticket is returned that can be used to access the element.
+    /// 
+    /// # Arguments
+    /// * `value` - The value to insert into the slotmap.
+    /// 
+    /// # Returns
+    /// A ticket that can be used to access the element in the slotmap. The value of the ticket
+    /// can then be accessed using the [`LocklessSlotmap::get`] method.
+    pub fn insert(&self, value: T) -> SlotmapTicket
+    {
+        let (ticket, blocks) = self.reserve_slots();
+        self.commit_insert(&blocks, ticket, value);
+        ticket
+    }
+
+    /// Inserts a new element into the slotmap without actually creating it.
+    /// 
+    /// Atomically reserves a slot in the slotmap without actually creating the element.
+    /// The slot can then be either committed or rolled back using the [`DelayedInsertion::commit`]
+    /// or [`DelayedInsertion::rollback`] methods. If the [`DelayedInsertion`] is dropped without
+    /// being committed, the slot is automatically rolled back.
+    /// 
+    /// # Returns
+    /// A [`DelayedInsertion`] that can be used to commit or rollback the insertion of the element
+    /// into the slotmap.
+    pub fn delayed_insert(&self) -> DelayedInsertion<'_, T, R>
+    {
+        // FIXME: Race condition using delayed insertion (deadlock)
+
+        // We drop the lock immediately as we want to be able to resize/insert
+        // while the delayed insertion takes place.
+        let (ticket, blocks) = self.reserve_slots();
+        drop(blocks);
+        DelayedInsertion {
+            slotmap: self,
+            ticket: ticket,
+            completed: false,
         }
     }
 
@@ -573,125 +927,15 @@ where
     /// An [`Option<T>`] containing the element stored in the slotmap at the specified ticket or
     /// [`Option::None`] if the ticket is invalid or the element has already been removed.
     pub fn erase(&self, ticket: SlotmapTicket) -> Option<T> {
-        let block_index = ticket.block_index();
-        let slot_index = ticket.slot_index();
-        let ticket_generation = ticket.generation();
-
-        // Acquire the read lock (shared access) to the blocks
         let blocks = self.blocks.read();
 
-        // Acquire the state of the slot
-        let block = &blocks[usize::from(block_index)];
-
-        // Acquire the state of the slot
-        let slot_state = &block.states[slot_index as usize];
-
-        // Begin of the critical section
-        let backoff = crossbeam::utils::Backoff::new();
-        'critical: loop {
-            // Check that the slot is occupied and the generation matches
-            let state = slot_state.state.load(std::sync::atomic::Ordering::SeqCst);
-            match state {
-                State::Occupied { generation } if generation == ticket_generation => (),
-                _ => break 'critical None, // The slot is not occupied or the generation does not match
-            }
-
-            // Attempt to transition the state of the slot to Reserved
-            if slot_state.state.compare_exchange(
-                state,
-                State::Reserved,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst
-            ).is_err() {
-                // Another thread has made a progress, retry
-                backoff.spin();
-                continue;
-            }
-
-            // Second loop: Await for the refcount to hit 0
-            'zeroref: loop {
-                let refcount = slot_state.refcount.load(std::sync::atomic::Ordering::SeqCst);
-                if refcount == 0 {
-                    break 'zeroref;
-                }
-
-                // Another thread has made a progress, retry
-                backoff.snooze();
-            }
-
-            // Retrieve the element
-            let element = unsafe {
-                block.elements[slot_index as usize].get().as_mut().unwrap().assume_init_read()
-            };
-
-            // We then attempt to transition the state of the slot to Free
-            if let Some(next_generation) = ticket_generation.checked_add(1) {
-                // We update the next_free_slot of the block so that it points to this slot (currently reserved)
-                let next_free_slot = 'update_slot: loop {
-                    let next_free_slot = block.next_free_slot.load(std::sync::atomic::Ordering::SeqCst);
-
-                    if block.next_free_slot.compare_exchange(
-                        next_free_slot,
-                        Some(slot_index),
-                        std::sync::atomic::Ordering::SeqCst,
-                        std::sync::atomic::Ordering::SeqCst
-                    ).is_err() {
-                        // Another thread has made a progress, retry
-                        backoff.spin();
-                        continue 'update_slot;
-                    }
-
-                    break 'update_slot next_free_slot;
-                };
-
-                // If next_free_slot is None, that means that this blog was dangling
-                // and now it is not anymore, we need to update the next_non_saturated_block
-                if next_free_slot.is_none() {
-                    let next_non_saturated_block = 'update_block: loop {
-                        let next_non_saturated_block = self.next_non_saturated_block.load(std::sync::atomic::Ordering::SeqCst);
-                        
-                        // Attempt to update the next_non_saturated_block
-                        if self.next_non_saturated_block.compare_exchange(
-                            next_non_saturated_block,
-                            Some(block_index as u64),
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst
-                        ).is_err() {
-                            // Another thread has made a progress, retry
-                            backoff.spin();
-                            continue 'update_block;
-                        }
-
-                        // We finally update the next_free_slot of the slot
-                        break 'update_block next_non_saturated_block;
-                    };
-
-                    // We then update the next_non_saturated_block of the block
-                    block.next_non_saturated_block.store(next_non_saturated_block, std::sync::atomic::Ordering::SeqCst);
-                };
-
-                // The generation has not reached the maximum value, we can reuse this slot
-                if slot_state.state.compare_exchange(
-                    State::Reserved,
-                    State::Free {
-                        next_generation: next_generation,
-                        next_free_slot: next_free_slot,
-                    },
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst
-                ).is_err() {
-                    panic!("refcount is 0, the slot is reserved, no overwriting should occur, this is a bug, please report it.");
-                }
-            }
-            else {
-                // The generation has reached the maximum value, we won't be reusing
-                // this slot, therefore we leave it as Reserved
-                self.generation_limit_reached.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-
-            self.len.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            break 'critical Some(element);
+        // Attempt to reserve the slot
+        if !self.reserve_occupied_slot(&blocks, ticket) {
+            return None;
         }
+
+        // Acquire the state of the slot
+        Some(self.rollback(&blocks, ticket, true).unwrap())
     }
 
     /// Get the maximum number of elements that can be stored in the slotmap.
